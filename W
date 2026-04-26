@@ -1,0 +1,126 @@
+import asyncio
+import pandas as pd
+import requests
+import json
+import os
+from playwright.async_api import async_playwright
+
+# --- НАСТРОЙКИ ---
+API_KEY = 'ВСТАВЬ_СЮДА_КЛЮЧ_ИЗ_DIFY' 
+API_URL = 'http://localhost/v1/workflows/run'
+EXCEL_FILE = 'leads.xlsx'
+
+async def run_agent():
+    if not os.path.exists(EXCEL_FILE):
+        print(f"Ошибка: Файл {EXCEL_FILE} не найден!")
+        return
+
+    async with async_playwright() as p:
+        print("Запуск браузера Chromium...")
+        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+        context = await browser.new_context(viewport=None)
+        page = await context.new_page()
+
+        # ШАГ 1: АВТОРИЗАЦИЯ
+        print("\n--- ЭТАП АВТОРИЗАЦИИ ---")
+        await page.goto("https://www.avito.ru/#login")
+        print("У тебя есть 60 секунд на вход в Авито!")
+        await asyncio.sleep(60) 
+
+        # ШАГ 2: ОБРАБОТКА ТАБЛИЦЫ
+        try:
+            df = pd.read_excel(EXCEL_FILE)
+            for col in ['Имя', 'Ответ_ИИ', 'Статус', 'Просмотры', 'Ниша']:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df.astype(object)
+        except Exception as e:
+            print(f"Ошибка чтения Excel: {e}")
+            await browser.close()
+            return
+
+        changed = False
+
+        for index, row in df.iterrows():
+            if str(row['Статус']).strip().lower() == 'запустить':
+                url = str(row['Ссылка']).strip()
+                print(f"\n[*] Работаю с: {url}")
+
+                try:
+                    # ПАРСИНГ
+                    await page.goto(url, wait_until="domcontentloaded")
+                    await asyncio.sleep(3)
+
+                    name_element = page.locator('[data-marker="seller-info/name"]').first
+                    name = await name_element.inner_text() if await name_element.count() > 0 else "Клиент"
+                    
+                    breadcrumb = page.locator('[data-marker="breadcrumbs/link"]')
+                    niche = await breadcrumb.nth(2).inner_text() if await breadcrumb.count() > 2 else "Общая"
+                    
+                    views_elem = page.locator('[data-marker="item-view/total-views"]')
+                    views = await views_elem.inner_text() if await views_elem.count() > 0 else "0"
+
+                    # ГЕНЕРАЦИЯ ОТВЕТА
+                    payload = {
+                        "inputs": {
+                            "client_name": name.strip(),
+                            "niche": niche.strip(),
+                            "details": f"{views.strip()} просмотров"
+                        },
+                        "user": "avito_robot"
+                    }
+                    headers = {
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/json; charset=utf-8"
+                    }
+                    
+                    response = requests.post(
+                        API_URL, 
+                        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), 
+                        headers=headers
+                    )
+                    
+                    if response.status_code == 200:
+                        ai_message = response.json().get('data', {}).get('outputs', {}).get('answer')
+                        
+                        # ОТПРАВКА
+                        chat_button = page.locator('[data-marker="item-view/messenger-button"]')
+                        if await chat_button.is_visible():
+                            await chat_button.click()
+                            await asyncio.sleep(4)
+                            
+                            input_selector = '[data-marker="chat-input/input"]'
+                            await page.wait_for_selector(input_selector)
+                            await page.fill(input_selector, ai_message)
+                            await asyncio.sleep(1)
+                            await page.keyboard.press("Enter")
+                            
+                            print(f"    [УСПЕХ] Отправлено для {name.strip()}")
+                            df.at[index, 'Статус'] = 'Отправлено'
+                            df.at[index, 'Ответ_ИИ'] = ai_message
+                            df.at[index, 'Имя'] = name.strip()
+                            df.at[index, 'Ниша'] = niche.strip()
+                            df.at[index, 'Просмотры'] = views.strip()
+                            changed = True
+                        else:
+                            print("    [!] Чат закрыт.")
+                            df.at[index, 'Статус'] = 'Чат закрыт'
+                    else:
+                        print(f"    [Ошибка Dify] Код {response.status_code}")
+
+                except Exception as e:
+                    print(f"    [Ошибка в цикле]: {e}")
+                
+                await asyncio.sleep(10) # Пауза между ссылками
+
+        if changed:
+            try:
+                df.to_excel(EXCEL_FILE, index=False)
+                print("\n--- ТАБЛИЦА ОБНОВЛЕНА ---")
+            except Exception as e:
+                print(f"Не удалось сохранить Excel: {e}")
+
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(run_agent())
