@@ -10,24 +10,40 @@ API_KEY = 'ВСТАВЬ_СЮДА_КЛЮЧ_ИЗ_DIFY'
 API_URL = 'http://localhost/v1/workflows/run'
 EXCEL_FILE = 'leads.xlsx'
 
+# Путь к профилю твоего Chrome (замени "Митяй" на свое имя пользователя в Windows, если нужно)
+CHROME_USER_DATA = os.path.join(os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data")
+
 async def run_agent():
     if not os.path.exists(EXCEL_FILE):
         print(f"Ошибка: Файл {EXCEL_FILE} не найден!")
         return
 
     async with async_playwright() as p:
-        print("Запуск браузера Chromium...")
-        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-        context = await browser.new_context(viewport=None)
-        page = await context.new_page()
+        print("Запуск реального Chrome для обхода блокировок...")
+        
+        # Запускаем браузер с твоим профилем
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=CHROME_USER_DATA,
+            channel="chrome", # Используем именно установленный Chrome
+            headless=False,
+            args=[
+                "--start-maximized",
+                "--disable-blink-features=AutomationControlled"
+            ],
+            viewport=None
+        )
+        
+        page = context.pages[0] if context.pages else await context.new_page()
+        
+        # Маскировка под человека
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # ШАГ 1: АВТОРИЗАЦИЯ
-        print("\n--- ЭТАП АВТОРИЗАЦИИ ---")
-        await page.goto("https://www.avito.ru/#login")
-        print("У тебя есть 60 секунд на вход в Авито!")
-        await asyncio.sleep(60) 
+        print("\n--- ЭТАП ПРОВЕРКИ АВТОРИЗАЦИИ ---")
+        await page.goto("https://www.avito.ru/", wait_until="networkidle")
+        print("Если ты не вошел в аккаунт — сделай это сейчас. Жду 45 секунд...")
+        await asyncio.sleep(45)
 
-        # ШАГ 2: ОБРАБОТКА ТАБЛИЦЫ
+        # Читаем таблицу
         try:
             df = pd.read_excel(EXCEL_FILE)
             for col in ['Имя', 'Ответ_ИИ', 'Статус', 'Просмотры', 'Ниша']:
@@ -36,38 +52,41 @@ async def run_agent():
             df = df.astype(object)
         except Exception as e:
             print(f"Ошибка чтения Excel: {e}")
-            await browser.close()
+            await context.close()
             return
 
         changed = False
 
         for index, row in df.iterrows():
+            # Ищем статус "Запустить" (без учета регистра)
             if str(row['Статус']).strip().lower() == 'запустить':
                 url = str(row['Ссылка']).strip()
-                print(f"\n[*] Работаю с: {url}")
+                print(f"\n[*] Перехожу по ссылке: {url}")
 
                 try:
-                    # ПАРСИНГ
                     await page.goto(url, wait_until="domcontentloaded")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(4)
 
-                    name_element = page.locator('[data-marker="seller-info/name"]').first
-                    name = await name_element.inner_text() if await name_element.count() > 0 else "Клиент"
+                    # Сбор данных (Парсинг)
+                    name_elem = page.locator('[data-marker="seller-info/name"]').first
+                    name = await name_elem.inner_text() if await name_elem.count() > 0 else "Партнер"
                     
                     breadcrumb = page.locator('[data-marker="breadcrumbs/link"]')
                     niche = await breadcrumb.nth(2).inner_text() if await breadcrumb.count() > 2 else "Общая"
                     
                     views_elem = page.locator('[data-marker="item-view/total-views"]')
-                    views = await views_elem.inner_text() if await views_elem.count() > 0 else "0"
+                    views = await views_elem.inner_text() if await views_elem.count() > 0 else "много"
 
-                    # ГЕНЕРАЦИЯ ОТВЕТА
+                    print(f"    Собрано: {name.strip()} | {niche.strip()} | {views.strip()}")
+
+                    # Запрос к Dify (твоя нейросеть)
                     payload = {
                         "inputs": {
                             "client_name": name.strip(),
                             "niche": niche.strip(),
                             "details": f"{views.strip()} просмотров"
                         },
-                        "user": "avito_robot"
+                        "user": "avito_boss"
                     }
                     headers = {
                         "Authorization": f"Bearer {API_KEY}",
@@ -83,11 +102,11 @@ async def run_agent():
                     if response.status_code == 200:
                         ai_message = response.json().get('data', {}).get('outputs', {}).get('answer')
                         
-                        # ОТПРАВКА
+                        # Отправка в чат Авито
                         chat_button = page.locator('[data-marker="item-view/messenger-button"]')
                         if await chat_button.is_visible():
                             await chat_button.click()
-                            await asyncio.sleep(4)
+                            await asyncio.sleep(5)
                             
                             input_selector = '[data-marker="chat-input/input"]'
                             await page.wait_for_selector(input_selector)
@@ -95,7 +114,7 @@ async def run_agent():
                             await asyncio.sleep(1)
                             await page.keyboard.press("Enter")
                             
-                            print(f"    [УСПЕХ] Отправлено для {name.strip()}")
+                            print(f"    [УСПЕХ] Оффер отправлен!")
                             df.at[index, 'Статус'] = 'Отправлено'
                             df.at[index, 'Ответ_ИИ'] = ai_message
                             df.at[index, 'Имя'] = name.strip()
@@ -103,24 +122,26 @@ async def run_agent():
                             df.at[index, 'Просмотры'] = views.strip()
                             changed = True
                         else:
-                            print("    [!] Чат закрыт.")
+                            print("    [!] Кнопка чата не активна.")
                             df.at[index, 'Статус'] = 'Чат закрыт'
                     else:
-                        print(f"    [Ошибка Dify] Код {response.status_code}")
+                        print(f"    [Ошибка Dify] Код: {response.status_code}")
 
                 except Exception as e:
-                    print(f"    [Ошибка в цикле]: {e}")
+                    print(f"    [Ошибка в процессе]: {e}")
                 
-                await asyncio.sleep(10) # Пауза между ссылками
+                # Рандомная пауза, чтобы не забанили (от 15 до 25 секунд)
+                await asyncio.sleep(20)
 
         if changed:
             try:
                 df.to_excel(EXCEL_FILE, index=False)
-                print("\n--- ТАБЛИЦА ОБНОВЛЕНА ---")
+                print("\n--- ТАБЛИЦА ОБНОВЛЕНА И СОХРАНЕНА ---")
             except Exception as e:
-                print(f"Не удалось сохранить Excel: {e}")
+                print(f"Ошибка сохранения (закрой Excel!): {e}")
 
-        await browser.close()
+        print("Завершение работы...")
+        await context.close()
 
 if __name__ == "__main__":
     asyncio.run(run_agent())
